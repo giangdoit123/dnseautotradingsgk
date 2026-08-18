@@ -22,9 +22,9 @@ async def main():
     # Initialize client
     encoding = "msgpack"  # json or msgpack
     client = TradingClient(
-        api_key="api-key",
-        api_secret="api-secret",
-        base_url="wss://ws-openapi.dnse.com.vn",
+        api_key="eyJvcmciOiJkbnNlIiwiaWQiOiIwOTU0MDY3MzExYjE0Njc5OTI2MTQ4MDc1NTQ2MDA5MCIsImgiOiJtdXJtdXIxMjgifQ==",
+        api_secret="QUs5hkSLxBi4laYlkkX8ShwZfJEfN0TIRu61U5yU3DhvJjDAifTq_OoKQlZcEvMA0a0zdj9M4gOxN4Tp0NR4VA",
+        base_url="wss://ws-openapi-uat.dnse.com.vn",
         encoding=encoding,
     )
 
@@ -39,7 +39,7 @@ async def main():
 
     print("Subscribing to ohlc closed for SSI, VN30F1M and VN30...")
     # internal 1 3 5 15 30 1H 1D 1W
-    await client.subscribe_ohlc_closed(["SSI", "VN30F1M", "VN30"], resolution="1", on_ohlc=handle_ohlc, encoding=encoding)
+    await client.subscribe_ohlc_closed(["SSI", "VN30F1M", "VN30"], on_ohlc=handle_ohlc, encoding=encoding)
 
     # Subscribe to 1-minute OHLC
 
