@@ -6,6 +6,7 @@ browser talks exclusively to 127.0.0.1 and never has to construct signatures,
 headers, query strings, or request bodies.
 """
 import asyncio
+import hmac
 import json
 from bisect import bisect_right
 import os
@@ -29,7 +30,10 @@ from strategy_ichimoku_volume_mtf import IchimokuVolumeMultiTimeframeStrategy  #
 
 HOST = os.environ.get("DNSE_UI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DNSE_UI_PORT", "8787"))
-ENV_ONLY = os.environ.get("DNSE_UI_ENV_ONLY", "0") == "1"
+# A Vercel Function is public by default. It must use server-side credentials,
+# never credentials typed into a browser.
+VERCEL_DEPLOYMENT = os.environ.get("VERCEL", "") == "1"
+ENV_ONLY = os.environ.get("DNSE_UI_ENV_ONLY", "0") == "1" or VERCEL_DEPLOYMENT
 MAX_BODY = 200_000
 IDENTIFIER = re.compile(r"^[A-Za-z0-9_.-]+$")
 
@@ -110,10 +114,32 @@ def json_value(value):
 
 
 def safe_operations():
-    return [{key: value for key, value in operation.items() if key != "path"} for operation in OPERATIONS]
+    operations = []
+    for operation in OPERATIONS:
+        # Serverless instances do not reliably retain OTP-derived trading tokens.
+        # A public endpoint is not an appropriate place to execute real trades.
+        if VERCEL_DEPLOYMENT and operation.get("danger"):
+            continue
+        operations.append({key: value for key, value in operation.items() if key != "path"})
+    return operations
+
+
+def load_server_credentials():
+    """Load credentials on demand so a cold Vercel Function can serve reads."""
+    if not ENV_ONLY or (SESSION["api_key"] and SESSION["api_secret"]):
+        return
+    load_dotenv()
+    api_key = os.environ.get("DNSE_API_KEY", "").strip()
+    api_secret = os.environ.get("DNSE_API_SECRET", "").strip()
+    if not api_key or not api_secret:
+        raise DashboardError("Thiếu DNSE_API_KEY hoặc DNSE_API_SECRET trong cấu hình máy chủ.")
+    environment = configured_environment()
+    base_url, ws_url = ENVIRONMENTS[environment]
+    SESSION.update({"api_key": api_key, "api_secret": api_secret, "base_url": base_url, "ws_url": ws_url})
 
 
 def require_client():
+    load_server_credentials()
     if not SESSION["api_key"] or not SESSION["api_secret"]:
         raise DashboardError("Nhập API key và API secret, rồi bấm Kết nối.")
     return DNSEClient(api_key=SESSION["api_key"], api_secret=SESSION["api_secret"], base_url=SESSION["base_url"], api_version=SESSION["api_version"])
@@ -160,6 +186,8 @@ def run_operation(payload):
     operation = OPERATION_BY_ID.get(payload.get("operation"))
     if not operation:
         raise DashboardError("Chức năng không tồn tại.")
+    if VERCEL_DEPLOYMENT and operation.get("danger"):
+        raise DashboardError("Bản Vercel chỉ cho phép đọc dữ liệu và backtest. Hãy dùng Docker/VPN riêng tư để giao dịch.")
     if operation.get("danger") and payload.get("confirmation") != "EXECUTE":
         raise DashboardError("Hãy xác nhận trước khi thực hiện giao dịch thật.")
     api = require_client()
@@ -291,6 +319,18 @@ def connect_from_env():
     return connect_credentials(api_key, api_secret, configured_environment())
 
 
+def require_access_token(headers):
+    """Protect the public Vercel API with a separate, user-chosen secret."""
+    if not VERCEL_DEPLOYMENT:
+        return
+    expected = os.environ.get("DNSE_UI_ACCESS_TOKEN", "")
+    supplied = headers.get("X-DNSE-Access-Token", "")
+    if not expected:
+        raise DashboardError("Thiếu DNSE_UI_ACCESS_TOKEN trong Vercel Environment Variables.")
+    if not hmac.compare_digest(supplied, expected):
+        raise DashboardError("Mã truy cập không hợp lệ.")
+
+
 def epoch(value):
     value = int(float(value))
     return value // 1000 if value > 1_000_000_000_000 else value
@@ -398,7 +438,16 @@ class Handler(SimpleHTTPRequestHandler):
         return
 
     def do_GET(self):
+        if self.path.startswith("/api/"):
+            try:
+                require_access_token(self.headers)
+            except DashboardError as exc:
+                return self.send_json({"error": str(exc)}, HTTPStatus.UNAUTHORIZED)
         if self.path == "/api/health":
+            try:
+                load_server_credentials()
+            except DashboardError:
+                pass
             return self.send_json({"connected": bool(SESSION["api_key"] and SESSION["api_secret"]), "accountNo": SESSION["account_no"] or None, "tokenReady": bool(SESSION["trading_token"]), "apiVersion": SESSION["api_version"], "environmentOnly": ENV_ONLY})
         if self.path == "/api/operations":
             return self.send_json({"operations": safe_operations()})
@@ -408,6 +457,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            require_access_token(self.headers)
             size = int(self.headers.get("Content-Length", "0"))
             if size > MAX_BODY:
                 raise DashboardError("Yêu cầu quá lớn.")

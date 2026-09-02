@@ -231,6 +231,7 @@ cả API key và API secret sang bộ key UAT.
 
 ## Tài liệu liên quan
 
+- [Triển khai Vercel chỉ đọc / backtest](deployment/VERCEL.md)
 - [Xác thực DNSE OpenAPI](https://developers.dnse.com.vn/docs/guide/intro/authentication/)
 - [Dữ liệu thị trường DNSE](https://developers.dnse.com.vn/docs/dnse/market-data/)
 - [Hướng dẫn UI chi tiết](python/ui/README.md)
