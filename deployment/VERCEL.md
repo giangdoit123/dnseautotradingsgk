@@ -20,8 +20,8 @@ sau cho Production (và Preview nếu muốn thử Preview):
 | `DNSE_WS_URL` | `wss://ws-openapi-uat.dnse.com.vn` khi thử UAT, hoặc URL WebSocket production DNSE. |
 | `DNSE_API_VERSION` | Phiên bản API DNSE, hiện dùng `2026-07-23`. |
 
-Mở trang Vercel, nhập `DNSE_UI_ACCESS_TOKEN` tại **Mã truy cập**, sau đó bấm
-**Dùng cấu hình máy chủ**. Mã truy cập không được lưu trong mã nguồn hay trình
+Mở trang Vercel, nhập `DNSE_UI_ACCESS_TOKEN` tại **Mã truy cập** rồi nhấn
+**Enter** để nạp dashboard. Mã truy cập không được lưu trong mã nguồn hay trình
 duyệt.
 
 ## Thiết lập lần đầu
