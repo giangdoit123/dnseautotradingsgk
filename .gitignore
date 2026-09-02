@@ -1,0 +1,13 @@
+# Runtime credentials and state must never enter source control.
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.*.example
+**/.trading_token.json
+**/.position*.json
+
+# Local tooling and Python cache.
+**/__pycache__/
+**/*.py[cod]
+.venv/
+.pytest_cache/

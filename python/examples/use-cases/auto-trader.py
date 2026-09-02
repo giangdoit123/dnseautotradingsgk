@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Full flow demo: stream prices -> strategy -> entry -> manage TP/SL exit.
+"""Full flow demo: stream prices -> strategy -> entry -> Base129-cross exit.
 
 End-to-end auto-trader with pluggable strategy AND risk/position management:
   1. Seed the candle buffer from the historical OHLC REST endpoint (so the
@@ -7,11 +7,11 @@ End-to-end auto-trader with pluggable strategy AND risk/position management:
      closed-OHLC WebSocket stream.
   2. Feed the rolling candle history (seeded history + new bars) to a pluggable
      Strategy (strategy_base).
-  3. On the first actionable Signal, print the trade plan (side/entry/SL/TP)
-     and size the position from a risk budget (position_manager.size_by_risk).
+  3. On the first actionable Signal, print the trade plan (side/entry) and use
+     the configured fixed position size for this no-TP/no-SL strategy.
   4. DRY RUN by default. With PLACE_ORDER=1 the PositionManager places the entry,
-     waits for the fill, then closes the position when price hits TP or SL
-     (or an optional time limit) and reports the result.
+     waits for the fill, then closes the position only on the confirmed Base129
+     cross in the opposite direction.
 
 Both the strategy and the risk manager are decoupled modules — swap either one
 without touching the rest. This is a demo, not a production trading system.
@@ -22,8 +22,8 @@ contract symbol (default 41I1G7000) — they refer to the same instrument/price.
 
 Config via env (or examples/.env):
     DNSE_API_KEY, DNSE_API_SECRET, DNSE_ACCOUNT_NO, DNSE_BASE_URL, DNSE_WS_URL,
-    SYMBOL, OHLC_SYMBOL, MARKET_TYPE, RESOLUTION, STRATEGY, QUANTITY, PLACE_ORDER,
-    RISK_POINTS, ENTRY_FILL_TIMEOUT, MANAGE_TIMEOUT
+    SYMBOL, OHLC_SYMBOL, MARKET_TYPE, RESOLUTION, STRATEGY, ENTRY_MODE, QUANTITY,
+    PLACE_ORDER, ENTRY_FILL_TIMEOUT
 Run: python examples/use-cases/auto-trader.py
 """
 import asyncio
@@ -39,29 +39,37 @@ sys.path.insert(0, _EXAMPLES_DIR)                           # examples/ (helpers
 
 from dnse import DNSEClient, TradingClient
 from dnse.websocket.models import Ohlc
+from env_util import load_dotenv
 from market_utils import to_order_price
-from position_manager import PositionManager, size_by_risk
+from position_manager import PositionManager
 from position_store import clear_position, load_position
 from strategy_base import Candle, get_strategy
 from token_store import ensure_trading_token
 from log_util import log
 import strategy_price_action  # noqa: F401  (registers the "price_action" strategy)
 import strategy_ichimoku      # noqa: F401  (registers the "ichimoku_cloud" strategy)
+import strategy_ichimoku_volume_mtf  # noqa: F401  (registers the "ichimoku_volume_mtf" strategy)
 import strategy_scalping      # noqa: F401  (registers the "scalping" strategy)
+
+# Load the local, gitignored examples/.env before reading the configuration.
+load_dotenv()
 
 SYMBOL = os.environ.get("SYMBOL", "41I1G7000")           # trading symbol (orders + order/trade/position events)
 OHLC_SYMBOL = os.environ.get("OHLC_SYMBOL", "VN30F1M")   # OHLC candles use the generic front-month alias
 MARKET_TYPE = os.environ.get("MARKET_TYPE", "DERIVATIVE")
 RESOLUTION = os.environ.get("RESOLUTION", "1")          # OHLC bar size (minutes)
 STRATEGY = os.environ.get("STRATEGY", "scalping")
+ENTRY_MODE = os.environ.get("ENTRY_MODE", "confirmed").strip().lower()
 QUANTITY = int(os.environ.get("QUANTITY", "1"))         # fixed size (fallback)
-RISK_POINTS = float(os.environ.get("RISK_POINTS", "0"))  # >0 -> size by risk
 ACCOUNT_NO = os.environ.get("DNSE_ACCOUNT_NO", "0001000115")
-PLACE_ORDER = os.environ.get("PLACE_ORDER", "1") == "1"
+PLACE_ORDER = os.environ.get("PLACE_ORDER", "0") == "1"
 ENTRY_FILL_TIMEOUT = float(os.environ.get("ENTRY_FILL_TIMEOUT", "30"))
-MANAGE_TIMEOUT = float(os.environ.get("MANAGE_TIMEOUT", "0"))  # 0 = wait until TP/SL
+MANAGE_TIMEOUT = float(os.environ.get("MANAGE_TIMEOUT", "0"))  # for strategies that define price exits
 ENCODING = os.environ.get("WS_ENCODING", "msgpack")  # price/trading stream encoding
 MAX_BARS = 200
+
+if ENTRY_MODE not in {"confirmed", "intrabar"}:
+    raise ValueError("ENTRY_MODE must be 'confirmed' or 'intrabar'")
 
 
 def _fmt_time(t):
@@ -125,9 +133,8 @@ def _print_plan(strat, signal, quantity):
     log(f"  mã        : {SYMBOL}  (tín hiệu từ {OHLC_SYMBOL})")
     log(f"  chiều     : {signal.side}")
     log(f"  giá vào   : {to_order_price(MARKET_TYPE, signal.entry)}")
-    log(f"  cắt lỗ    : {to_order_price(MARKET_TYPE, signal.stop_loss)}")
-    log(f"  chốt lời  : {to_order_price(MARKET_TYPE, signal.take_profit)}")
-    log(f"  khối lượng: {quantity}" + (f"  (rủi ro {RISK_POINTS} điểm)" if RISK_POINTS else ""))
+    log(f"  thoát lệnh: Long cắt xuống / Short cắt lên qua Base129 (nến đóng xác nhận)")
+    log(f"  khối lượng: {quantity}")
     log(f"  lý do     : {signal.reason}")
 
 
@@ -139,38 +146,78 @@ async def trade_loop(rest, ws, strat, price):
     """
     candles = fetch_history(rest, OHLC_SYMBOL, RESOLUTION, MARKET_TYPE)
     log(f"Đã nạp {len(candles)} nến lịch sử {RESOLUTION}m của {OHLC_SYMBOL}")
+    daily_candles = fetch_history(rest, OHLC_SYMBOL, "1D", MARKET_TYPE, bars=60)
+    if hasattr(strat, "set_daily_candles"):
+        strat.set_daily_candles(daily_candles)
+    log(f"Đã nạp {len(daily_candles)} nến ngày của {OHLC_SYMBOL} cho bộ lọc đa khung")
     box = {"signal": None}
     fired = asyncio.Event()
     busy = {"v": False}  # True while a trade is being placed/managed
+    active_manager = {"value": None}
+
+    def consider_entry(sig, source):
+        """Queue at most one signal while retaining the exact source snapshot."""
+        if not sig.actionable:
+            log(f"  ❌ chưa đủ điều kiện ({source}): {sig.reason}")
+        elif busy["v"]:
+            log(f"  ⏸ đủ điều kiện ({sig.side}, {source}) nhưng ĐANG GIỮ 1 vị thế → bỏ qua (mỗi lần 1 lệnh)")
+        elif box["signal"] is not None:
+            log(f"  ⏸ đủ điều kiện ({sig.side}, {source}) nhưng đã có tín hiệu đang chờ xử lý → bỏ qua")
+        else:
+            log(f"  ✅ ĐỦ ĐIỀU KIỆN vào lệnh ({source}): {sig.side} entry={sig.entry} | {sig.reason}")
+            box["signal"] = sig
+            fired.set()
 
     def on_ohlc(bar: Ohlc):
         # Combine history + the new bar for the decision.
         _append_bar(candles, bar)
+
+        manager = active_manager["value"]
+        if manager is not None and hasattr(strat, "should_exit_on_base_line_cross"):
+            should_exit, reason = strat.should_exit_on_base_line_cross(manager.side, candles)
+            if should_exit:
+                manager.exit_on_signal("Base129 cross: " + reason, bar.close)
 
         # Log every OHLC bar received.
         log(f"[OHLC {bar.symbol} {RESOLUTION}m {_fmt_time(bar.time)}] "
               f"O={bar.open} H={bar.high} L={bar.low} C={bar.close} V={bar.volume} "
               f"(bars={len(candles)})")
 
-        # Log whether entry conditions are met — and whether we act on them.
-        sig = strat.analyze(candles)
-        if not sig.actionable:
-            log(f"  ❌ chưa đủ điều kiện: {sig.reason}")
-        elif busy["v"]:
-            log(f"  ⏸ đủ điều kiện ({sig.side}) nhưng ĐANG GIỮ 1 vị thế → bỏ qua (mỗi lần 1 lệnh)")
-        elif box["signal"] is not None:
-            log(f"  ⏸ đủ điều kiện ({sig.side}) nhưng đã có tín hiệu đang chờ xử lý → bỏ qua")
-        else:
-            log(f"  ✅ ĐỦ ĐIỀU KIỆN vào lệnh: {sig.side} entry={sig.entry} "
-                f"SL={sig.stop_loss} TP={sig.take_profit} | {sig.reason}")
-            box["signal"] = sig
-            fired.set()
+        if ENTRY_MODE == "confirmed":
+            consider_entry(strat.analyze(candles), "nến đã đóng")
+
+    def on_intrabar_ohlc(bar: Ohlc):
+        """Evaluate the forming candle from the ordinary real-time OHLC stream.
+
+        The callback only sees values published by DNSE at that instant: current
+        high/low/close and cumulative volume. It never replaces the completed
+        history, which remains owned by the closed-OHLC subscription.
+        """
+        if candles and candles[-1].time == str(bar.time):
+            return  # The closed feed has already made this candle historical.
+        snapshot = candles + [Candle(str(bar.time), bar.open, bar.high, bar.low, bar.close, bar.volume)]
+        consider_entry(strat.analyze(snapshot), "OHLC realtime nội nến")
+
+    def on_daily_ohlc(bar: Ohlc):
+        _append_bar(daily_candles, bar)
+        if hasattr(strat, "set_daily_candles"):
+            strat.set_daily_candles(daily_candles)
+        log(f"[OHLC ngày {bar.symbol} {_fmt_time(bar.time)}] C={bar.close} V={bar.volume}")
 
     await ws.subscribe_ohlc_closed(
         [OHLC_SYMBOL], resolution=RESOLUTION, on_ohlc=on_ohlc, encoding=ENCODING
     )
+    if ENTRY_MODE == "intrabar":
+        await ws.subscribe_ohlc(
+            [OHLC_SYMBOL], resolution=RESOLUTION, on_ohlc=on_intrabar_ohlc, encoding=ENCODING
+        )
+    if hasattr(strat, "set_daily_candles"):
+        await ws.subscribe_ohlc_closed(
+            [OHLC_SYMBOL], resolution="1D", on_ohlc=on_daily_ohlc, encoding=ENCODING
+        )
+    source = "OHLC realtime nội nến" if ENTRY_MODE == "intrabar" else "nến đã đóng"
     log(f"Đang nghe nến {RESOLUTION}m {ENCODING} của {OHLC_SYMBOL} "
-          f"(giao dịch {SYMBOL}) với chiến lược '{strat.name}'...")
+          f"(giao dịch {SYMBOL}) với chiến lược '{strat.name}', vào theo {source}...")
 
     while True:
         await fired.wait()
@@ -179,7 +226,7 @@ async def trade_loop(rest, ws, strat, price):
         if signal is None:
             continue
 
-        quantity = size_by_risk(signal.entry, signal.stop_loss, RISK_POINTS, QUANTITY)
+        quantity = QUANTITY
         _print_plan(strat, signal, quantity)
 
         if not PLACE_ORDER:
@@ -187,15 +234,17 @@ async def trade_loop(rest, ws, strat, price):
             continue
 
         busy["v"] = True
-        manager = _new_manager(rest, ws, quantity)
-        price["cb"] = manager.feed_price  # route live-OHLC prices into TP/SL
+        manager = _new_manager(rest, ws, quantity, signal)
+        active_manager["value"] = manager
+        price["cb"] = manager.feed_price  # retain last price for the Base129 exit order
         try:
-            log("Đang vào lệnh + quản lý TP/SL...")
+            log("Đang vào lệnh + chờ tín hiệu thoát Base129...")
             _report(await manager.run(signal))
         except Exception as exc:  # never let a trade error stop the app
             log(f"Lỗi khi đặt/quản lý lệnh: {type(exc).__name__}: {exc} — tiếp tục theo dõi")
         finally:
             price["cb"] = None
+            active_manager["value"] = None
             busy["v"] = False
         log("Tiếp tục theo dõi tín hiệu tiếp theo...\n")
 
@@ -222,13 +271,14 @@ def _open_qty(rest, symbol):
     return total
 
 
-def _new_manager(rest, ws, quantity):
+def _new_manager(rest, ws, quantity, signal=None):
+    no_fixed_exit = signal is not None and signal.stop_loss is None and signal.take_profit is None
     return PositionManager(
         rest, ws,
         account_no=ACCOUNT_NO, symbol=SYMBOL, market_type=MARKET_TYPE,
         quantity=quantity, loan_package_id=_loan_package_id(rest),
         trading_token=ensure_trading_token(rest),
-        entry_fill_timeout=ENTRY_FILL_TIMEOUT, manage_timeout=MANAGE_TIMEOUT,
+        entry_fill_timeout=ENTRY_FILL_TIMEOUT, manage_timeout=0 if no_fixed_exit else MANAGE_TIMEOUT,
         encoding=ENCODING,
     )
 
@@ -243,7 +293,7 @@ def _report(result):
         log(f"  không vào lệnh: {result.reason}")
 
 
-async def _resume_if_any(rest, ws, price):
+async def _resume_if_any(rest, ws, price, strat):
     """If a persisted position exists (and is still open at the broker), manage it.
 
     Returns True if it handled a resume (caller should stop), else False.
@@ -263,8 +313,23 @@ async def _resume_if_any(rest, ws, price):
         clear_position()
         return False
 
-    log(f"Sàn xác nhận còn {open_qty} vị thế mở → khôi phục quản lý TP/SL.")
+    log(f"Sàn xác nhận còn {open_qty} vị thế mở → khôi phục chờ tín hiệu thoát Base129.")
     manager = _new_manager(rest, ws, int(saved["quantity"]))
+
+    # A restored position also needs the same closed-candle exit rule.
+    candles = fetch_history(rest, OHLC_SYMBOL, RESOLUTION, MARKET_TYPE)
+
+    def on_closed_ohlc(bar: Ohlc):
+        _append_bar(candles, bar)
+        if hasattr(strat, "should_exit_on_base_line_cross"):
+            should_exit, reason = strat.should_exit_on_base_line_cross(manager.side, candles)
+            if should_exit:
+                manager.exit_on_signal("Base129 cross: " + reason, bar.close)
+
+    if hasattr(strat, "should_exit_on_base_line_cross"):
+        await ws.subscribe_ohlc_closed(
+            [OHLC_SYMBOL], resolution=RESOLUTION, on_ohlc=on_closed_ohlc, encoding=ENCODING
+        )
     price["cb"] = manager.feed_price
     try:
         _report(await manager.resume(saved))
@@ -291,8 +356,8 @@ async def main():
     )
     await ws.connect()
 
-    # Live OHLC price feed for TP/SL risk management — subscribed once at startup,
-    # NOT logged per message. Forwards the current price to the active manager.
+    # Live OHLC price feed is subscribed once at startup and supplies the latest
+    # price for a close order after the Base129 exit signal.
     price = {"last": None, "cb": None}
 
     def on_price(bar: Ohlc):
@@ -301,11 +366,11 @@ async def main():
             price["cb"](bar.close)
 
     await ws.subscribe_ohlc([OHLC_SYMBOL], resolution=RESOLUTION, on_ohlc=on_price, encoding=ENCODING)
-    log(f"Nghe nến {RESOLUTION}m (thường) của {OHLC_SYMBOL} cho TP/SL (không log từng nến)")
+    log(f"Nghe nến {RESOLUTION}m (thường) của {OHLC_SYMBOL} để lấy giá thoát (không log từng nến)")
 
     try:
         # Resume a position carried over from a previous run, if any (one-shot).
-        await _resume_if_any(rest, ws, price)
+        await _resume_if_any(rest, ws, price, strat)
         # Then run continuously: watch signals, trade, and keep going.
         await trade_loop(rest, ws, strat, price)
     finally:

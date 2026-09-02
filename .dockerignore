@@ -1,0 +1,9 @@
+.git
+.venv
+**/__pycache__
+**/*.py[cod]
+**/.env
+**/.trading_token.json
+**/.position*.json
+.pytest_cache
+deployment/.env.production

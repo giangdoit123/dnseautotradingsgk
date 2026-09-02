@@ -3,7 +3,7 @@
 Flow-oriented sample scripts that drive this SDK's **`DNSEClient`** (REST) and
 **`TradingClient`** (WebSocket). Unlike the one-endpoint-per-file scripts under
 `trading-api/`, `marketdata-api/`, etc., these show complete real-world flows —
-up to a full auto-trader (stream prices → strategy → order → manage TP/SL).
+up to a full auto-trader (stream prices → strategy → order → Base129-cross exit).
 
 All API work goes through the SDK clients; HMAC request signing lives inside the
 SDK (`dnse/api/common.py` for REST, `dnse/websocket/auth.py` for WS) and is
@@ -102,7 +102,7 @@ body. Supported `market_type` / `order_category` combinations are:
 pagination metadata. Order IDs returned by the order APIs are strings; pass
 them unchanged to `get_order_detail()`, `put_order()`, and `cancel_order()`.
 
-Auto-trader (strategy → entry → manage TP/SL):
+Auto-trader (strategy → entry → Base129-cross exit):
 
 ```bash
 # DRY RUN (default): stream prices, print the strategy's trade plan, no order
@@ -120,7 +120,7 @@ PLACE_ORDER=1 STRATEGY=ichimoku_cloud RISK_POINTS=6 python examples/use-cases/au
 | `use-cases/market-data.py` | `get_security_definition` price limits | No |
 | `use-cases/order-history.py` | `get_order_history` + `get_positions` | No |
 | `use-cases/place-a-trade.py` | OTP → `post_order` → confirm over WS → `cancel_order` (**real order**) | Yes |
-| `use-cases/auto-trader.py` | **Full loop**: stream OHLC → strategy → entry → TP/SL exit, with risk sizing + restart-safe position | Yes (if `PLACE_ORDER=1`) |
+| `use-cases/auto-trader.py` | **Full loop**: stream OHLC → strategy → entry → Base129-cross exit, restart-safe position | Yes (if `PLACE_ORDER=1`) |
 | `reference/orders-email-otp.py` | Full order lifecycle, Email OTP | Yes |
 | `reference/orders-smart-otp.py` | Full order lifecycle, SmartOTP | Yes |
 
@@ -129,10 +129,9 @@ PLACE_ORDER=1 STRATEGY=ichimoku_cloud RISK_POINTS=6 python examples/use-cases/au
 `use-cases/auto-trader.py` wires the pieces together:
 
 1. Subscribe to **closed OHLC bars** over WebSocket, keeping a rolling history.
-2. Run a pluggable **Strategy** on each bar → a `Signal(side, entry, stop_loss, take_profit)`.
-3. **Risk sizing** (`position_manager.size_by_risk`): quantity from a risk budget.
-4. Place the **entry**, wait for the fill, then **exit when price hits TP or SL**
-   (or a time limit) — `PositionManager`.
+2. Run a pluggable **Strategy** on each bar → a `Signal(side, entry)`.
+3. Place the **entry** with the configured fixed quantity, wait for the fill,
+   then **exit only when Base129 is crossed in the opposite direction**.
 5. The open position is **persisted** to `.position.json`; if the app restarts it
    reloads and keeps managing that position instead of opening a new one
    (reconciled against the broker's open quantity first).
@@ -149,7 +148,7 @@ customers can swap either without touching the rest.
 | `strategy_ichimoku.py` | `ichimoku_cloud` — Ichimoku (cloud/Tenkan-Kijun/Chikou) + RSI + ADX filter |
 | `strategy_scalping.py` | `scalping` — EMA 8/21 + RSI 7 + MACD 8/17/9 momentum, ATR-based stops |
 | `indicators.py` | Pure-Python `rsi`, `adx`, `ema`, `macd`, `atr`, `ichimoku` (26-period displacement) |
-| `position_manager.py` | `size_by_risk` + `PositionManager` (fill → monitor TP/SL → close; persistence) |
+| `position_manager.py` | `PositionManager` (fill → wait for strategy exit → close; persistence) |
 | `position_store.py` | Persist / load / clear the open position (`.position.json`) |
 | `token_store.py` | Cache the trading token (`.trading_token.json`, ~8h) |
 | `otp_email.py` | Auto-fetch OTP over IMAP + load `.env` |
@@ -181,6 +180,58 @@ Import it in `auto-trader.py` (next to the other `import strategy_*`) and run wi
 > `side`: `NB` = buy/long, `NS` = sell/short. Short (`NS`) is only valid for
 > `DERIVATIVE`; Vietnamese stocks cannot be shorted.
 
+### Ichimoku volume: hai luồng 1 phút và 3 phút độc lập
+
+Chiến lược `ichimoku_volume_mtf` chạy hai lần độc lập: một lần trên nến 1 phút,
+một lần trên nến 3 phút. Cả hai đều dùng nến ngày cho bộ lọc RSI và không kiểm
+tra hoặc điều chỉnh tín hiệu của nhau:
+
+- Long khi Base Line 129 kỳ hướng lên, nằm cao hơn cả Leading Span A/B của mây
+  Kumo, volume nến hiện tại ít nhất gấp 2 lần SMA volume 20 nến trước đó, và
+  RSI ngày không vượt 60. Leading Span A dùng Conversion 9 kỳ và Base 129 kỳ;
+  Leading Span B dùng 52 kỳ, dịch trước 26 nến.
+- Short khi Base Line 129 kỳ hướng xuống, nằm thấp hơn cả Leading Span A/B của
+  mây Kumo, volume nến hiện tại ít nhất gấp 2 lần SMA volume 20 nến trước đó và
+  không cần giá đóng nằm dưới Base Line.
+- Khi đang giữ vị thế, đóng lệnh tại giá đóng của chính khung nến nếu giá cắt
+  Base Line 129 ngược chiều: long cắt xuống, short cắt lên.
+- Đặt `ENTRY_MODE=intrabar` để xét snapshot OHLC realtime đang hình thành và
+  vào ngay trong nến N. `ENTRY_MODE=confirmed` chỉ xét nến đã đóng.
+
+Chạy thử với:
+
+```bash
+STRATEGY=ichimoku_volume_mtf TIMEFRAMES=1,3 PLACE_ORDER=0 python examples/use-cases/auto-trader-multi-timeframe.py
+```
+
+Mỗi khung có tiến trình và tệp trạng thái riêng (`.position_1m.json` và
+`.position_3m.json`). Chỉ đặt `PLACE_ORDER=1` sau khi đã đánh giá kết quả chạy
+thử và xác nhận tiểu khoản, mã hợp đồng và quản trị rủi ro.
+
+### Backtest lịch sử
+
+`backtest_ichimoku_volume_mtf.py` chỉ đọc dữ liệu OHLC của DNSE; nó không lấy
+OTP, Trading Token hoặc gửi lệnh. Mặc định, tín hiệu được khớp tại giá mở của
+nến tiếp theo. Thêm `--entry-mode intrabar_close` để gắn lệnh vào giá đóng của
+nến N như một proxy OHLC cho chế độ realtime nội nến. OHLC lịch sử không có
+từng snapshot nội nến, nên đây không phải là phát lại tick. Không có take profit
+hoặc stop loss cố định: lệnh chỉ thoát theo Base129. Mô hình cũng trừ phí và
+trượt giá theo basis point ở cả hai chiều.
+
+```bash
+python examples/backtest_ichimoku_volume_mtf.py --resolution 1 --days 30
+```
+
+```bash
+python examples/backtest_ichimoku_volume_mtf.py --resolution 1 --days 30 --entry-mode intrabar_close
+```
+
+Dùng `--output report.json` để lưu toàn bộ lệnh mô phỏng hoặc `--show-trades`
+để in chi tiết ra màn hình. Kết quả lịch sử không đảm bảo hiệu quả tương lai;
+hãy đánh giá thêm các giai đoạn khác nhau trước khi thử UAT.
+
+Chạy lại cùng lệnh với `--resolution 3` để có báo cáo độc lập cho luồng 3 phút.
+
 ## Environment variables
 
 | Variable | Used by | Default | Notes |
@@ -198,12 +249,13 @@ Import it in `auto-trader.py` (next to the other `import strategy_*`) and run wi
 | `SYMBOL` | auto-trader | `41I1G7000` | trading symbol (orders + order/trade/position events) |
 | `OHLC_SYMBOL` | auto-trader | `VN30F1M` | OHLC data symbol (generic front-month alias) |
 | `MARKET_TYPE` | auto-trader / order flows | `DERIVATIVE` | `STOCK` or `DERIVATIVE` |
-| `RESOLUTION` | auto-trader | `5` | OHLC bar minutes |
+| `RESOLUTION` | auto-trader | `1` | OHLC bar minutes |
+| `ENTRY_MODE` | auto-trader | `confirmed` | `intrabar` dùng OHLC realtime đang hình thành; `confirmed` đợi nến đóng |
+| `TIMEFRAMES` | multi-timeframe runner | `1,3` | independent strategy timeframes; accepts `1`, `3`, or `1,3` |
 | `STRATEGY` | auto-trader | `price_action` | registered strategy name |
 | `QUANTITY` | auto-trader | `1` | fixed size (fallback) |
-| `RISK_POINTS` | auto-trader | `0` | >0 → size by risk budget / stop distance |
 | `ENTRY_FILL_TIMEOUT` | auto-trader | `30` | cancel entry if unfilled (s) |
-| `MANAGE_TIMEOUT` | auto-trader | `0` | 0 = wait until TP/SL; else time-based exit (s) |
+| `MANAGE_TIMEOUT` | auto-trader | `0` | 0 = chỉ chờ Base129 cross; khác 0 = thoát theo thời gian (không dùng cho chiến lược này) |
 | `PLACE_ORDER` | auto-trader | `0` | `1` = trade for real |
 | `WS_ENCODING` | place-a-trade / auto-trader | `msgpack` | WebSocket stream encoding (`msgpack` or `json`) |
 

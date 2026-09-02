@@ -1,3 +1,4 @@
 .env
 .trading_token.json
 .position.json
+.position_*.json

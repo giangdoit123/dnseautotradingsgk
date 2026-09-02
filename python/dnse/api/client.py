@@ -2,6 +2,7 @@
 import json
 import os
 from urllib import parse
+import certifi
 import urllib3
 
 
@@ -31,8 +32,8 @@ class DNSEClient:
             maxsize=10,             # Số connections tối đa mỗi pool
             block=False,            # Không block khi pool đầy
             timeout=urllib3.Timeout(connect=30.0, read=60.0),
-            cert_reqs = 'CERT_NONE',  # Không yêu cầu certificate
-            assert_hostname = False  # Không kiểm tra hostname
+            cert_reqs="CERT_REQUIRED",
+            ca_certs=certifi.where(),
         )
 
     def get_accounts(self, dry_run=False):

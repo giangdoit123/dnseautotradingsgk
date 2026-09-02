@@ -2,7 +2,8 @@
 """Pluggable strategy interface for the auto-trader demo.
 
 A strategy takes the recent candle history and returns a Signal describing the
-trade to take (side + entry + stop-loss + take-profit), or a "no trade" signal.
+trade to take. A strategy may optionally define price-based stop-loss and
+take-profit levels; it is not required to do so.
 
 To add your own strategy: subclass Strategy, decorate it with @register, give it
 a unique `name`, and import your module before calling get_strategy(name).
@@ -31,8 +32,8 @@ class Signal:
 
     side: Optional[str] = None       # "NB" = long/buy, "NS" = short/sell, None = flat
     entry: float = 0.0
-    stop_loss: float = 0.0
-    take_profit: float = 0.0
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
     reason: str = ""
 
     @property

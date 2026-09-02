@@ -1,0 +1,35 @@
+services:
+  dnse-ui:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    container_name: dnse-trading-ui
+    restart: unless-stopped
+    env_file:
+      - ${DNSE_ENV_FILE:-.env.production}
+    environment:
+      DNSE_UI_HOST: 0.0.0.0
+      DNSE_UI_PORT: "8787"
+      # Credentials are read only on the server through the "Dùng .env" button.
+      DNSE_UI_ENV_ONLY: "1"
+    ports:
+      # Deliberately private. Reach it through a VPN/private tunnel, never a
+      # public port-forward without a separate authentication gateway.
+      - "127.0.0.1:8787:8787"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "from urllib.request import urlopen; urlopen('http://127.0.0.1:8787/api/health', timeout=5)"
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 10s
