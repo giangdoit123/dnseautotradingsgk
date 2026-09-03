@@ -1,1 +1,1 @@
-from _shared import handler
+from api._shared import handler
