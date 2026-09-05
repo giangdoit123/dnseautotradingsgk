@@ -18,6 +18,7 @@ class DNSEClient:
             algorithm="hmac-sha256",
             hmac_nonce_enabled=True,
             api_version=None,
+            timeout=None,
     ):
         self._api_key = api_key
         self._api_secret = api_secret
@@ -31,7 +32,9 @@ class DNSEClient:
             num_pools=10,           # Số lượng connection pools
             maxsize=10,             # Số connections tối đa mỗi pool
             block=False,            # Không block khi pool đầy
-            timeout=urllib3.Timeout(connect=30.0, read=60.0),
+            # Callers serving a web request can supply a shorter timeout so a
+            # downstream outage becomes a useful error instead of a hung page.
+            timeout=timeout or urllib3.Timeout(connect=30.0, read=60.0),
             cert_reqs="CERT_REQUIRED",
             ca_certs=certifi.where(),
         )

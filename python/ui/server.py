@@ -18,6 +18,8 @@ from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import urllib3
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 EXAMPLES = ROOT / "examples"
@@ -134,15 +136,31 @@ def load_server_credentials():
     if not api_key or not api_secret:
         raise DashboardError("Thiếu DNSE_API_KEY hoặc DNSE_API_SECRET trong cấu hình máy chủ.")
     environment = configured_environment()
-    base_url, ws_url = ENVIRONMENTS[environment]
-    SESSION.update({"api_key": api_key, "api_secret": api_secret, "base_url": base_url, "ws_url": ws_url})
+    default_base_url, default_ws_url = ENVIRONMENTS[environment]
+    # Honour the explicit Vercel values as well as the production/UAT preset.
+    # This keeps each credential pair bound to the endpoint configured by the
+    # project without ever exposing either secret to the browser.
+    base_url = os.environ.get("DNSE_BASE_URL", default_base_url).strip() or default_base_url
+    ws_url = os.environ.get("DNSE_WS_URL", default_ws_url).strip() or default_ws_url
+    api_version = os.environ.get("DNSE_API_VERSION", SESSION["api_version"]).strip() or SESSION["api_version"]
+    SESSION.update({
+        "api_key": api_key, "api_secret": api_secret, "base_url": base_url,
+        "ws_url": ws_url, "api_version": api_version,
+    })
 
 
 def require_client():
     load_server_credentials()
     if not SESSION["api_key"] or not SESSION["api_secret"]:
         raise DashboardError("Nhập API key và API secret, rồi bấm Kết nối.")
-    return DNSEClient(api_key=SESSION["api_key"], api_secret=SESSION["api_secret"], base_url=SESSION["base_url"], api_version=SESSION["api_version"])
+    # Vercel is only used for the read-only demo.  Fail quickly enough to
+    # return a diagnostic to the visitor rather than waiting for the browser
+    # request to expire while DNSE is unreachable from the Function region.
+    timeout = urllib3.Timeout(connect=7.0, read=12.0) if VERCEL_DEPLOYMENT else None
+    return DNSEClient(
+        api_key=SESSION["api_key"], api_secret=SESSION["api_secret"],
+        base_url=SESSION["base_url"], api_version=SESSION["api_version"], timeout=timeout,
+    )
 
 
 def parse_response(body):

@@ -6,6 +6,8 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import urllib3
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "python"))
 
@@ -63,5 +65,9 @@ class handler(BaseHTTPRequestHandler):
             }})
         except DashboardError as exc:
             return self.send_json({"error": str(exc)}, HTTPStatus.BAD_GATEWAY)
-        except Exception:
-            return self.send_json({"error": "Không thể tải dữ liệu thị trường DNSE cho demo."}, HTTPStatus.BAD_GATEWAY)
+        except urllib3.exceptions.HTTPError:
+            return self.send_json({
+                "error": "DNSE không phản hồi kịp từ máy chủ Vercel. Hãy thử lại; nếu vẫn lặp lại, kiểm tra DNSE_API_KEY, DNSE_API_SECRET và DNSE_BASE_URL.",
+            }, HTTPStatus.GATEWAY_TIMEOUT)
+        except Exception as exc:
+            return self.send_json({"error": f"Không thể tải dữ liệu thị trường DNSE ({type(exc).__name__})."}, HTTPStatus.BAD_GATEWAY)
