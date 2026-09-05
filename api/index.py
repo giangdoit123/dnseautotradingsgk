@@ -11,7 +11,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "python"))
 
 from ui.server import DashboardError, Handler as DashboardHandler, run_visual_backtest  # noqa: E402
 
-ALLOWED_ENDPOINTS = {"health", "operations", "connect", "connect-env", "run", "ws", "backtest", "public-demo"}
+ALLOWED_ENDPOINTS = {"health", "operations", "connect", "connect-env", "run", "ws", "backtest", "public-demo", "public-demo-1", "public-demo-3"}
 
 
 class handler(BaseHTTPRequestHandler):
@@ -35,31 +35,32 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.endpoint():
             return
-        if self.path == "/api/public-demo":
-            return self.public_demo()
+        if self.path in {"/api/public-demo", "/api/public-demo-1", "/api/public-demo-3"}:
+            resolution = self.path.rsplit("-", 1)[-1] if self.path != "/api/public-demo" else None
+            return self.public_demo(resolution)
         return DashboardHandler.do_GET(self)
 
     def do_POST(self):
         if self.endpoint():
             return DashboardHandler.do_POST(self)
 
-    def public_demo(self):
+    def public_demo(self, resolution=None):
         """Serve only market-data backtest output; never account or trade APIs."""
         try:
             base_payload = {
                 "symbol": os.environ.get("OHLC_SYMBOL", "VN30F1M"),
                 "marketType": os.environ.get("MARKET_TYPE", "DERIVATIVE"),
                 "entryMode": "intrabar_close",
-                "days": 30,
+                "days": 10,
                 "commissionBps": 2,
                 "slippageBps": 1,
             }
-            return self.send_json({
-                "timeframes": {
-                    "1": run_visual_backtest({**base_payload, "resolution": "1"}),
-                    "3": run_visual_backtest({**base_payload, "resolution": "3"}),
-                }
-            })
+            if resolution:
+                return self.send_json(run_visual_backtest({**base_payload, "resolution": resolution}))
+            return self.send_json({"timeframes": {
+                "1": run_visual_backtest({**base_payload, "resolution": "1"}),
+                "3": run_visual_backtest({**base_payload, "resolution": "3"}),
+            }})
         except DashboardError as exc:
             return self.send_json({"error": str(exc)}, HTTPStatus.BAD_GATEWAY)
         except Exception:
