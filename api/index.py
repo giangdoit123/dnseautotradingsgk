@@ -46,16 +46,20 @@ class handler(BaseHTTPRequestHandler):
     def public_demo(self):
         """Serve only market-data backtest output; never account or trade APIs."""
         try:
-            data = run_visual_backtest({
+            base_payload = {
                 "symbol": os.environ.get("OHLC_SYMBOL", "VN30F1M"),
                 "marketType": os.environ.get("MARKET_TYPE", "DERIVATIVE"),
-                "resolution": os.environ.get("RESOLUTION", "1"),
                 "entryMode": "intrabar_close",
                 "days": 30,
                 "commissionBps": 2,
                 "slippageBps": 1,
+            }
+            return self.send_json({
+                "timeframes": {
+                    "1": run_visual_backtest({**base_payload, "resolution": "1"}),
+                    "3": run_visual_backtest({**base_payload, "resolution": "3"}),
+                }
             })
-            return self.send_json(data)
         except DashboardError as exc:
             return self.send_json({"error": str(exc)}, HTTPStatus.BAD_GATEWAY)
         except Exception:
