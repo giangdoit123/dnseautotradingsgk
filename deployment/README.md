@@ -19,8 +19,8 @@ Tailscale hoặc SSH tunnel. Không mở cổng 8787 trên firewall/router.
 Tạo tệp bí mật (tệp này bị `.dockerignore` loại khỏi image):
 
 ```bash
-cp deployment/.env.production.example deployment/.env.production
-chmod 600 deployment/.env.production
+cp deployment/.env.production.example deployment/.env
+chmod 600 deployment/.env
 ```
 
 Điền `DNSE_API_KEY` và `DNSE_API_SECRET`. Không đặt OTP hoặc Trading Token vào

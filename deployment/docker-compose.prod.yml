@@ -6,7 +6,7 @@ services:
     container_name: dnse-trading-ui
     restart: unless-stopped
     env_file:
-      - ${DNSE_ENV_FILE:-.env.production}
+      - ${DNSE_ENV_FILE:-.env}
     environment:
       DNSE_UI_HOST: 0.0.0.0
       DNSE_UI_PORT: "8787"

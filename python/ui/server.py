@@ -127,8 +127,8 @@ def safe_operations():
 
 
 def load_server_credentials():
-    """Load credentials on demand so a cold Vercel Function can serve reads."""
-    if not ENV_ONLY or (SESSION["api_key"] and SESSION["api_secret"]):
+    """Load local or server-side credentials on demand for read-only charts."""
+    if SESSION["api_key"] and SESSION["api_secret"]:
         return
     load_dotenv()
     api_key = os.environ.get("DNSE_API_KEY", "").strip()
@@ -448,6 +448,26 @@ def run_visual_backtest(payload):
     }
 
 
+def public_demo_payload(resolution=None):
+    """Return the read-only, two-timeframe demo used by local and Vercel UI."""
+    base_payload = {
+        "symbol": os.environ.get("OHLC_SYMBOL", "VN30F1M"),
+        "marketType": os.environ.get("MARKET_TYPE", "DERIVATIVE"),
+        "entryMode": "intrabar_close",
+        "days": 10,
+        "commissionBps": 2,
+        "slippageBps": 1,
+    }
+    if resolution:
+        if resolution not in {"1", "3"}:
+            raise DashboardError("Khung thời gian demo không hợp lệ.")
+        return run_visual_backtest({**base_payload, "resolution": resolution})
+    return {"timeframes": {
+        "1": run_visual_backtest({**base_payload, "resolution": "1"}),
+        "3": run_visual_backtest({**base_payload, "resolution": "3"}),
+    }}
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(Path(__file__).parent), **kwargs)
@@ -456,6 +476,14 @@ class Handler(SimpleHTTPRequestHandler):
         return
 
     def do_GET(self):
+        if self.path in {"/api/public-demo", "/api/public-demo-1", "/api/public-demo-3"}:
+            try:
+                resolution = self.path.rsplit("-", 1)[-1] if self.path != "/api/public-demo" else None
+                return self.send_json(public_demo_payload(resolution))
+            except DashboardError as exc:
+                return self.send_json({"error": str(exc)}, HTTPStatus.BAD_GATEWAY)
+            except Exception as exc:
+                return self.send_json({"error": f"Không thể tải dữ liệu thị trường DNSE ({type(exc).__name__})."}, HTTPStatus.BAD_GATEWAY)
         if self.path.startswith("/api/"):
             try:
                 require_access_token(self.headers)

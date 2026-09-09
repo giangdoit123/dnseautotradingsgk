@@ -11,7 +11,7 @@ import urllib3
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "python"))
 
-from ui.server import DashboardError, Handler as DashboardHandler, run_visual_backtest  # noqa: E402
+from ui.server import DashboardError, Handler as DashboardHandler, public_demo_payload  # noqa: E402
 
 ALLOWED_ENDPOINTS = {"health", "operations", "connect", "connect-env", "run", "ws", "backtest", "public-demo", "public-demo-1", "public-demo-3"}
 
@@ -49,20 +49,7 @@ class handler(BaseHTTPRequestHandler):
     def public_demo(self, resolution=None):
         """Serve only market-data backtest output; never account or trade APIs."""
         try:
-            base_payload = {
-                "symbol": os.environ.get("OHLC_SYMBOL", "VN30F1M"),
-                "marketType": os.environ.get("MARKET_TYPE", "DERIVATIVE"),
-                "entryMode": "intrabar_close",
-                "days": 10,
-                "commissionBps": 2,
-                "slippageBps": 1,
-            }
-            if resolution:
-                return self.send_json(run_visual_backtest({**base_payload, "resolution": resolution}))
-            return self.send_json({"timeframes": {
-                "1": run_visual_backtest({**base_payload, "resolution": "1"}),
-                "3": run_visual_backtest({**base_payload, "resolution": "3"}),
-            }})
+            return self.send_json(public_demo_payload(resolution))
         except DashboardError as exc:
             return self.send_json({"error": str(exc)}, HTTPStatus.BAD_GATEWAY)
         except urllib3.exceptions.HTTPError:
